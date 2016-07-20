@@ -79,7 +79,6 @@ void loop() {
   }
   mqttClient.loop();
   yield();
-
 }
 
 void configModeCallback (WiFiManager *myWiFiManager) {
