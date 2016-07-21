@@ -6,13 +6,12 @@
 #include <DallasTemperature.h>
 #include <OneWire.h>
 
-const char* espGenieFirmwareVersion     = "espGenie Firmware Version - 1.3";
-
-WiFiClient espClient;
-PubSubClient mqttClient(espClient); // TODO Check client name..
+const char* espGenieFirmwareVersion     = "espGenie Firmware Version - 1.4";
 
 // TODO
 // Params https://gist.github.com/knnniggett/7dec273b7b634e955284
+//  mqtt dest, userdevicedeviceName, password, port
+// Allow local toggle without MQTT connection
 // wifi auto reconnect
 // mqtt auto reconnect
 // GPIO - reset wifi..use 1st switch at startup?  https://github.com/tzapu/WiFiManager/blob/master/examples/OnDemandConfigPortal/OnDemandConfigPortal.ino
@@ -20,29 +19,39 @@ PubSubClient mqttClient(espClient); // TODO Check client name..
 // Minimum Send Interval
 // Configure from HG and save to EEPROM.
 // RSSI as percentage, see http://www.speedguide.net/faq/how-does-rssi-dbm-relate-to-signal-quality-percent-439
+// MQTT Get Version
+// OTA Support
+// Multiple Relays & Switches
+// Swap MAC Addr to DeviceID
+
+// Testing outside of HG - TODO Move to README.md
+// use moquette as a standalone mqtt broker on windows or other platforms (java based) https://github.com/andsel/moquette
+// use mqtt.fx as a standalone mqtt client on windows or other platforms (java based) http://mqttfx.jfx4ee.org/
   
 // Define pin mappings
 #define ONE_WIRE_BUS 2
-#define RELAY_PIN 6
+#define RELAY_PIN 5
 #define SWITCH_PIN 13
-#define RECEIVER_PIN 12
+
 
 // Set Default Poll Interval for checking sensor
 #define POLL_INTERVAL_SECS 10
 
 // MQTT Settings
-#define mqtt_server "192.168.0.161"
+#define mqtt_server "192.168.0.176"
 #define mqtt_server_port 1883
-#define mqtt_user ""
-#define mqtt_password ""
+//#define mqtt_user ""
+//#define mqtt_password ""
 #define base_topic "home/"
 #define temperature_topic "/sensor/temp"
 #define wifi_topic "/sensor/signal"
 
 float previousTemperature[20];
+float diff = 1.0;
+
 int reconnectCount = 0;
 int numberOfDevices;
-String clientMac = "";
+String ssid;
 long previousrssi;
 unsigned long previousMillis = 0;
 
@@ -63,6 +72,9 @@ byte previous = HIGH;
 unsigned long firstTime; // how long since the button was first pressed
 int triggered = 0;
 
+WiFiClient espClient;
+PubSubClient mqttClient(espClient); // TODO Check client name..
+
 // Setup a oneWire instance
 OneWire oneWire(ONE_WIRE_BUS);
 
@@ -70,15 +82,17 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
   
 void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(115200);
 
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT); 
+  pinMode(RELAY_PIN, HIGH);
+  
   WiFiManager wifiManager;
 
   //reset settings - for testing  
-  wifiManager.resetSettings();
+  //wifiManager.resetSettings();
 
-  wifiManager.setDebugOutput(true);
+  //wifiManager.setDebugOutput(true);
   
   wifiManager.setTimeout(180);
 
@@ -101,7 +115,7 @@ void setup() {
   wifiManager.addParameter(&customVersionText);
   
   //Dynamically create the SSID from the ChipId
-  String ssid = "espGenie_" + String(ESP.getChipId());
+  ssid = "espGenie_" + String(ESP.getChipId());
 
   // Loop if unable to connect to configured Wifi
   if(!wifiManager.autoConnect(ssid.c_str(),NULL)) {
@@ -115,16 +129,8 @@ void setup() {
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 
-  // Set hostname - TODO, make this configurable
+  // Set hostname
   WiFi.hostname(ssid);
-
-  // Get Mac Address
-  unsigned char mac[6];
-  WiFi.macAddress(mac);
-  clientMac += macToStr(mac); 
-
-  Serial.print("Device MAC Address: ");
-  Serial.println(clientMac);
     
   // MQTT Configuration
   mqttClient.setClient(espClient);
@@ -174,34 +180,28 @@ void loop() {
         digitalWrite(RELAY_PIN, relayPreviousState);
       }
     }
-  }else{
-  if (currentMillis - previousMillis >= (POLL_INTERVAL_SECS  * 1000)) {     // Timed Loop for sensors
-      previousMillis = currentMillis;       // Save last time we ran
-
-      float temperature;
-      sensors.requestTemperatures();
-      sendSignalStrength();
-
-      // Step through each sensor
-      for(int i=0;i<numberOfDevices; i++)
-      {
-        // Serial.print("Processing Sensor ");
-        // Serial.println(i);
-        float temperature;
-        temperature = sensors.getTempCByIndex(i);
-        if (temperature != previousTemperature[i])
-        {
-          //Serial.print("Sensor ");
-          //Serial.print(i);
-          //Serial.print(" Changed, Temp: ");
-          //Serial.println(temperature);
-
-          sendTemperature(temperature,i);
-          previousTemperature[i] = temperature;
-        }
-      }
-    } // End Sensor Timed Loop
   }
+  if (currentMillis - previousMillis >= (POLL_INTERVAL_SECS  * 1000)) { // Timed Loop for sensors
+    previousMillis = currentMillis;       // Save last time we ran
+
+    sensors.requestTemperatures();
+    sendSignalStrength();
+
+    // Step through each sensor
+    for(int i=0;i<numberOfDevices; i++) {
+      float temperature = sensors.getTempCByIndex(i);
+      if (checkBound(temperature, previousTemperature[i], diff)) {
+        Serial.print("Sensor ");
+        Serial.print(i);
+        Serial.print(", Temp: ");
+        Serial.println(temperature);
+
+        sendTemperature(temperature,i);
+        previousTemperature[i] = temperature;
+      }
+    }
+  } // End Sensor Timed Loop
+  
  
   current = digitalRead(SWITCH_PIN);
 
@@ -211,14 +211,7 @@ void loop() {
   millis_held = (millis() - firstTime);
   secs_held = millis_held / 1000;
 
-  // This if statement is a basic debouncing tool, the button must be pushed for at least
-  // 50 milliseconds in a row for it to be considered as a push.
-  if (millis_held > 50) {
-
-    //if (current == LOW && secs_held > prev_secs_held) {
-      // Serial.println("Each second the button is held blink the indicator led");
-      // Serial.println(millis_held);
-    //}
+  if (millis_held > 50) { //debounce 50 ms
 
     if (current == LOW && secs_held >=2 && triggered == 0) {
       triggered = 1;
@@ -226,7 +219,7 @@ void loop() {
       flashEnabled = !flashEnabled;
     }
 
-    // check if the button was released since we last checked
+    // check if the button was released since last checked
     if (current == HIGH && previous == LOW) {
 
       if (secs_held <= 0) {
@@ -243,7 +236,6 @@ void loop() {
 
   previous = current;
   prev_secs_held = secs_held;   
-  
   
   mqttClient.loop();
   yield();
@@ -308,14 +300,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-String macToStr(const uint8_t* mac) {
-  String result;
-  for (int i = 0; i < 6; ++i) {
-    result += String(mac[i], 16);
-  }
-  return result;
-}
-
 void printAddress(DeviceAddress deviceAddress) { 
    Serial.print(" address: { "); 
    for (uint8_t i = 0; i < 8; i++) 
@@ -342,7 +326,7 @@ void sendSignalStrength() {
     if (rssi != previousrssi)
     {
       String SignalTopic;
-      SignalTopic = base_topic + String(clientMac) + String(wifi_topic);
+      SignalTopic = base_topic + String(ssid) + String(wifi_topic);
   
       if (! mqttClient.publish(String(SignalTopic).c_str(), String(rssi).c_str(), true)) { 
         Serial.println("Publish failed"); 
@@ -356,7 +340,7 @@ void sendSignalStrength() {
 void sendTemperature(float temperature,int sensorIndex) {  
   // Construct topic containing sensor number
   String Topic;
-  Topic = base_topic + String(clientMac) + String(temperature_topic) + sensorIndex;
+  Topic = base_topic + String(ssid) + String(temperature_topic) + sensorIndex;
   MQTTconnect();  
    
   if (! mqttClient.publish(String(Topic).c_str(), String(temperature).c_str(), true)) { Serial.println("Publish failed"); }    
@@ -364,7 +348,7 @@ void sendTemperature(float temperature,int sensorIndex) {
 
 void sendStatus(String message) {
   String StatusTopic;
-  StatusTopic = base_topic + String(clientMac) + "/output/status";
+  StatusTopic = base_topic + String(ssid) + "/output/status";
   if (!mqttClient.publish(String(StatusTopic).c_str(), String(message).c_str(), true)) { 
      Serial.println("Publish status message failed"); 
    }  
@@ -381,7 +365,7 @@ void MQTTconnect() {
     Serial.println("Attempting to establish MQTT connection");
     // Attempt to connect 
     #ifndef mqtt_user
-        if (MQTTclient.connect("clientID")) {          
+        if (mqttClient.connect(ssid.c_str())) {          
             Serial.println("MQTT Connected");
         } else {
             Serial.print("MQTT Connect Failed.");
@@ -392,7 +376,7 @@ void MQTTconnect() {
             delay(5000);
         }
     #else
-        if (mqttClient.connect("clientID", mqtt_user, mqtt_password)) {
+        if (mqttClient.connect(ssid.c_str(), mqtt_user, mqtt_password)) {
             Serial.println("MQTT Connected");
         } else {
             Serial.print("MQTT Connect Failed.");
@@ -406,14 +390,18 @@ void MQTTconnect() {
     
     // Publish Device Startup
     String startupTopic = String(base_topic) + "automation/startup";
-    mqttClient.publish(String(startupTopic).c_str(), String(clientMac).c_str(), true); 
+    mqttClient.publish(String(startupTopic).c_str(), String(ssid).c_str(), true); 
    
-    String commandTopic = base_topic + String(clientMac) + "/command";
+    String commandTopic = base_topic + String(ssid) + "/command";
     Serial.print("Subscribing to command topic ");
     Serial.println(commandTopic);
     mqttClient.subscribe(String(commandTopic).c_str());
   }
+}
 
+bool checkBound(float newValue, float prevValue, float maxDiff) {
+  return !isnan(newValue) &&
+         (newValue < prevValue - maxDiff || newValue > prevValue + maxDiff);
 }
 
 
