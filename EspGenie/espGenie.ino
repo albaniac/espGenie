@@ -1,5 +1,4 @@
 #include <Arduino.h>
-
 #include <ESP8266WiFi.h>          //ESP8266 Core WiFi Library
 // #include <DNSServer.h>            //Local DNS Server used for redirecting all requests to the configuration portal
 #include <ESP8266WebServer.h>     //Local WebServer used to serve the configuration portal
@@ -34,7 +33,6 @@ const char* espGenieFirmwareVersion     = "espGenie Firmware Version - 1.4";
 #define ONE_WIRE_BUS 2
 #define RELAY_PIN 5
 #define SWITCH_PIN 13
-
 
 // Set Default Poll Interval for checking sensor
 #define POLL_INTERVAL_SECS 10
@@ -83,6 +81,86 @@ OneWire oneWire(ONE_WIRE_BUS);
 // Pass oneWire reference to DallasTemperature.
 DallasTemperature sensors(&oneWire);
   
+void setup() {
+
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT); 
+  pinMode(RELAY_PIN, HIGH);
+  
+  WiFiManager wifiManager;
+
+  //reset settings - for testing  
+  //wifiManager.resetSettings();
+
+  //wifiManager.setDebugOutput(true);
+  
+  wifiManager.setTimeout(180);
+
+  char versionBuffer[50];    // this needs to be large enough for the version text and tags
+  strcpy(versionBuffer, "<p>");
+  strcat(versionBuffer, espGenieFirmwareVersion);
+  strcat(versionBuffer, "</p>");
+
+  // The extra parameters to be configured (can be either global or just in the setup)
+  // After connecting, parameter.getValue() will get you the configured value
+  WiFiManagerParameter customVersionText(versionBuffer);
+
+  //set config save notify callback
+  //wifiManager.setSaveConfigCallback(saveConfigCallback);
+  
+  // callback for when device enters configuration mode on failed WiFi connection attempt. 
+  wifiManager.setAPCallback(configModeCallback);
+
+  //add all your parameters here
+  wifiManager.addParameter(&customVersionText);
+  
+  //Dynamically create the SSID from the ChipId
+  ssid = "espGenie_" + String(ESP.getChipId());
+
+  // Loop if unable to connect to configured Wifi
+  if(!wifiManager.autoConnect(ssid.c_str(),NULL)) {
+    Serial.println("Failed to connect and hit timeout");
+    delay(3000);
+    ESP.reset();
+    delay(5000);
+  } 
+
+  Serial.println("espGenie WiFi Connected.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Set hostname
+  WiFi.hostname(ssid);
+    
+  // MQTT Configuration
+  mqttClient.setClient(espClient);
+  mqttClient.setServer(mqtt_server, mqtt_server_port);
+  mqttClient.setCallback(mqttCallback);  
+  MQTTconnect();
+
+  // Get sensor details
+  sensors.begin();
+  DeviceAddress tmp_address; 
+  numberOfDevices = sensors.getDeviceCount(); 
+  Serial.print(numberOfDevices);
+  Serial.println(" temperature sensor(s) found"); 
+  for(int i=0;i<numberOfDevices; i++) 
+  {
+   Serial.print("Sensor ");
+   Serial.print(i); 
+   sensors.getAddress(tmp_address, i);
+   
+   printAddress(tmp_address); 
+   Serial.println(); 
+    
+   Serial.print("Setting resolution to 9 bit for Sensor ");
+   Serial.println(i); 
+   sensors.setResolution(tmp_address, 9); // LOWER IS FASTER, 12,10,9
+  }
+  
+  // Configure toggle button
+  pinMode(SWITCH_PIN, INPUT);
+}
 
 void loop() { 
 
@@ -123,8 +201,8 @@ void loop() {
       }
     }
   } // End Sensor Timed Loop
-  
- 
+
+  // get switch current state 
   current = digitalRead(SWITCH_PIN);
 
   // if the button state changes to pressed, remember the start time 
@@ -179,8 +257,48 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     message_buff[i] = payload[i];
   }
   message_buff[i] = '\0';
-  String msgString = String(message_buff);
+  //String msgString = String(message_buff);
+  processMessage(String(message_buff));
+}
+
+void printAddress(DeviceAddress deviceAddress) { 
+   Serial.print(" address: { "); 
+   for (uint8_t i = 0; i < 8; i++) 
+   { 
+     // zero pad the address if necessary 
+     Serial.print("0x"); 
+     if (deviceAddress[i] < 16) Serial.print("0"); 
+     Serial.print(deviceAddress[i], HEX); 
+     if (i<7) Serial.print(", ");   
+   } 
+   Serial.print(" }"); 
+ } 
+
+void mqttReconnect() {
+    // reconnect code from PubSubClient example
+}
+
+void sendSignalStrength() {
+    // if (WiFi.status() != WL_CONNECTED) { wifiConnect(); } //TODO: Do reconnect better...
+
+    long rssi = WiFi.RSSI();
+    
+    // Changed, so send the signal strength.
+    if (rssi != previousrssi)
+    {
+      String SignalTopic;
+      SignalTopic = base_topic + String(ssid) + String(wifi_topic);
   
+      if (! mqttClient.publish(String(SignalTopic).c_str(), String(rssi).c_str(), true)) { 
+        Serial.println("Publish failed"); 
+      }    
+
+      // Store Previous Signal Strength
+      previousrssi = rssi;
+    }
+}
+
+void processMessage(String msgString) {
   if (msgString.equals("ON")) {
     disableFlash();
     digitalWrite(RELAY_PIN, HIGH);
@@ -220,43 +338,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print("Unrecognised Command: ");
     Serial.println(msgString);
   }
-}
-
-void printAddress(DeviceAddress deviceAddress) { 
-   Serial.print(" address: { "); 
-   for (uint8_t i = 0; i < 8; i++) 
-   { 
-     // zero pad the address if necessary 
-     Serial.print("0x"); 
-     if (deviceAddress[i] < 16) Serial.print("0"); 
-     Serial.print(deviceAddress[i], HEX); 
-     if (i<7) Serial.print(", ");   
-   } 
-   Serial.print(" }"); 
- } 
-
-void mqttReconnect() {
-    // reconnect code from PubSubClient example
-}
-
-void sendSignalStrength() {
-    // if (WiFi.status() != WL_CONNECTED) { wifiConnect(); } //TODO: Do reconnect better...
-
-    long rssi = WiFi.RSSI();
-    
-    // Changed, so send the signal strength.
-    if (rssi != previousrssi)
-    {
-      String SignalTopic;
-      SignalTopic = base_topic + String(ssid) + String(wifi_topic);
   
-      if (! mqttClient.publish(String(SignalTopic).c_str(), String(rssi).c_str(), true)) { 
-        Serial.println("Publish failed"); 
-      }    
-
-      // Store Previous Signal Strength
-      previousrssi = rssi;
-    }
 }
 
 void sendTemperature(float temperature,int sensorIndex) {  
