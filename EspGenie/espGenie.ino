@@ -7,14 +7,12 @@
 #include <DallasTemperature.h>
 #include <OneWire.h>
 
-const char* espGenieFirmwareVersion     = "espGenie Firmware Version - 1.4";
+const char* espGenieFirmwareVersion     = "espGenie Firmware Version - 1.5";
 
 // TODO
 // Params https://gist.github.com/knnniggett/7dec273b7b634e955284
-//  mqtt dest, userdevicedeviceName, password, port
-// Allow local toggle without MQTT connection
+// mqtt dest, userdevicedeviceName, password, port
 // wifi auto reconnect
-// mqtt auto reconnect
 // GPIO - reset wifi..use 1st switch at startup?  https://github.com/tzapu/WiFiManager/blob/master/examples/OnDemandConfigPortal/OnDemandConfigPortal.ino
 // Look at previous range of values and only send if beyond threshold
 // Minimum Send Interval
@@ -45,6 +43,8 @@ const char* espGenieFirmwareVersion     = "espGenie Firmware Version - 1.4";
 #define base_topic "home/"
 #define temperature_topic "/sensor/temp"
 #define wifi_topic "/sensor/signal"
+unsigned long  mqttReconnectIntervalSecs = 10;
+long lastMQTTReconnectionAttempt = 0;
 
 float previousTemperature[20];
 float diff = 1.0;
@@ -111,7 +111,7 @@ void setup() {
   // callback for when device enters configuration mode on failed WiFi connection attempt. 
   wifiManager.setAPCallback(configModeCallback);
 
-  //add all your parameters here
+  // add all your parameters here
   wifiManager.addParameter(&customVersionText);
   
   //Dynamically create the SSID from the ChipId
@@ -136,27 +136,11 @@ void setup() {
   mqttClient.setClient(espClient);
   mqttClient.setServer(mqtt_server, mqtt_server_port);
   mqttClient.setCallback(mqttCallback);  
-  MQTTconnect();
 
-  // Get sensor details
-  sensors.begin();
-  DeviceAddress tmp_address; 
-  numberOfDevices = sensors.getDeviceCount(); 
-  Serial.print(numberOfDevices);
-  Serial.println(" temperature sensor(s) found"); 
-  for(int i=0;i<numberOfDevices; i++) 
-  {
-   Serial.print("Sensor ");
-   Serial.print(i); 
-   sensors.getAddress(tmp_address, i);
-   
-   printAddress(tmp_address); 
-   Serial.println(); 
-    
-   Serial.print("Setting resolution to 9 bit for Sensor ");
-   Serial.println(i); 
-   sensors.setResolution(tmp_address, 9); // LOWER IS FASTER, 12,10,9
-  }
+  // Get and configure temperature sensors
+  getSensors();
+  
+  //MQTTconnect();
   
   // Configure toggle button
   pinMode(SWITCH_PIN, INPUT);
@@ -165,6 +149,14 @@ void setup() {
 void loop() { 
 
   unsigned long currentMillis = millis();
+  
+  if (!mqttClient.connected()) {
+    if (currentMillis - lastMQTTReconnectionAttempt > mqttReconnectIntervalSecs * 1000) {
+      lastMQTTReconnectionAttempt = currentMillis;
+      // Attempt to reconnect
+      if (reconnect()) { lastMQTTReconnectionAttempt = 0; }
+    }
+  }
   
   if (flashEnabled) {
     if (currentMillis - previousFlashMillis >= flashIntervalms) {
@@ -184,9 +176,11 @@ void loop() {
   if (currentMillis - previousMillis >= (POLL_INTERVAL_SECS  * 1000)) { // Timed Loop for sensors
     previousMillis = currentMillis;       // Save last time we ran
 
-    sensors.requestTemperatures();
-    sendSignalStrength();
+    // send signal strength if connected to mqtt broker
+    if (mqttClient.connected()) { sendSignalStrength(); }
 
+    sensors.requestTemperatures();
+   
     // Step through each sensor
     for(int i=0;i<numberOfDevices; i++) {
       float temperature = sensors.getTempCByIndex(i);
@@ -195,8 +189,7 @@ void loop() {
         Serial.print(i);
         Serial.print(", Temp: ");
         Serial.println(temperature);
-
-        sendTemperature(temperature,i);
+        if (mqttClient.connected()) { sendTemperature(temperature,i); }
         previousTemperature[i] = temperature;
       }
     }
@@ -226,7 +219,7 @@ void loop() {
         // Button press
         disableFlash();
         digitalWrite(RELAY_PIN, !digitalRead(RELAY_PIN));
-        sendStatus(String(digitalRead(RELAY_PIN)));
+        if (mqttClient.connected()) { sendStatus(String(digitalRead(RELAY_PIN))); }
       }
               
       // button released so clear flag to stop it running multiple times
@@ -237,8 +230,31 @@ void loop() {
   previous = current;
   prev_secs_held = secs_held;   
   
-  mqttClient.loop();
+  if (mqttClient.connected()) { mqttClient.loop(); }
   yield();
+}
+
+void getSensors() {
+  
+  // Get temperature sensor details
+  sensors.begin();
+  DeviceAddress tmp_address; 
+  numberOfDevices = sensors.getDeviceCount(); 
+  Serial.print(numberOfDevices);
+  Serial.println(" temperature sensor(s) found"); 
+  for(int i=0;i<numberOfDevices; i++) 
+  {
+   Serial.print("Sensor ");
+   Serial.print(i); 
+   sensors.getAddress(tmp_address, i);
+   
+   printAddress(tmp_address); 
+   Serial.println(); 
+    
+   Serial.print("Setting resolution to 9 bit for Sensor ");
+   Serial.println(i); 
+   sensors.setResolution(tmp_address, 9); // LOWER IS FASTER, 12,10,9
+  }
 }
 
 void configModeCallback (WiFiManager *myWiFiManager) {
@@ -274,10 +290,6 @@ void printAddress(DeviceAddress deviceAddress) {
    Serial.print(" }"); 
  } 
 
-void mqttReconnect() {
-    // reconnect code from PubSubClient example
-}
-
 void sendSignalStrength() {
     // if (WiFi.status() != WL_CONNECTED) { wifiConnect(); } //TODO: Do reconnect better...
 
@@ -286,11 +298,10 @@ void sendSignalStrength() {
     // Changed, so send the signal strength.
     if (rssi != previousrssi)
     {
-      String SignalTopic;
-      SignalTopic = base_topic + String(ssid) + String(wifi_topic);
+      String SignalTopic = base_topic + String(ssid) + String(wifi_topic);
   
       if (! mqttClient.publish(String(SignalTopic).c_str(), String(rssi).c_str(), true)) { 
-        Serial.println("Publish failed"); 
+        Serial.println("Publish signal strength failed"); 
       }    
 
       // Store Previous Signal Strength
@@ -343,16 +354,14 @@ void processMessage(String msgString) {
 
 void sendTemperature(float temperature,int sensorIndex) {  
   // Construct topic containing sensor number
-  String Topic;
-  Topic = base_topic + String(ssid) + String(temperature_topic) + sensorIndex;
-  MQTTconnect();  
+  String Topic = base_topic + String(ssid) + String(temperature_topic) + sensorIndex;
+  //MQTTconnect();  
    
-  if (! mqttClient.publish(String(Topic).c_str(), String(temperature).c_str(), true)) { Serial.println("Publish failed"); }    
+  if (! mqttClient.publish(String(Topic).c_str(), String(temperature).c_str(), true)) { Serial.println("Publish temperature failed"); }    
 }
 
 void sendStatus(String message) {
-  String StatusTopic;
-  StatusTopic = base_topic + String(ssid) + "/output/status";
+  String StatusTopic = base_topic + String(ssid) + "/output/status";
   if (!mqttClient.publish(String(StatusTopic).c_str(), String(message).c_str(), true)) { 
      Serial.println("Publish status message failed"); 
    }  
@@ -361,7 +370,45 @@ void sendStatus(String message) {
 void disableFlash() {
   flashEnabled = false;
   flashCounter = 0;
- }
+}
+
+boolean reconnect (){
+
+    Serial.println("Attempting to establish MQTT connection");
+    // Attempt to connect 
+    #ifndef mqtt_user
+        if (mqttClient.connect(ssid.c_str())) {          
+            Serial.println("MQTT Connected");
+        } else {
+            Serial.print("MQTT Connect Failed. Return code= ");
+            Serial.println(mqttClient.state());
+        }
+    #else
+        if (mqttClient.connect(ssid.c_str(), mqtt_user, mqtt_password)) {
+            Serial.println("MQTT Connected");
+        } else {
+            Serial.print("MQTT Connect Failed. Return code= ");
+            Serial.println(mqttClient.state());
+        }
+    #endif
+
+    // if we connected then publish startup message and subscribe
+    if (mqttClient.connected()) { MQTTstartup(); }
+
+    return mqttClient.connected();
+}
+
+void MQTTstartup() {
+  // Once connected, publish device startup message
+  String startupTopic = String(base_topic) + "automation/startup";
+  mqttClient.publish(String(startupTopic).c_str(), String(ssid).c_str(), true); 
+  
+  // resubscribe to command topic
+  String commandTopic = base_topic + String(ssid) + "/command";
+  Serial.print("Subscribing to command topic ");
+  Serial.println(commandTopic);
+  mqttClient.subscribe(String(commandTopic).c_str());
+}
 
 void MQTTconnect() {
   // Loop until we're reconnected
@@ -372,8 +419,7 @@ void MQTTconnect() {
         if (mqttClient.connect(ssid.c_str())) {          
             Serial.println("MQTT Connected");
         } else {
-            Serial.print("MQTT Connect Failed.");
-            Serial.print("Return code= ");
+            Serial.print("MQTT Connect Failed. Return code= ");
             Serial.println(mqttClient.state());
             Serial.println("Trying again in 5 seconds");
             // Wait 5 seconds before retrying
@@ -383,8 +429,7 @@ void MQTTconnect() {
         if (mqttClient.connect(ssid.c_str(), mqtt_user, mqtt_password)) {
             Serial.println("MQTT Connected");
         } else {
-            Serial.print("MQTT Connect Failed.");
-            Serial.print("Return code= ");
+            Serial.print("MQTT Connect Failed. Return code= ");
             Serial.println(mqttClient.state());
             Serial.println("Trying again in 5 seconds");
             // Wait 5 seconds before retrying
